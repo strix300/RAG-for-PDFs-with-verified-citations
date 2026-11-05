@@ -1,5 +1,20 @@
+x-build: &build
+  context: .
+  args:
+    TORCH_REQUIREMENT: torch==2.14.1
+    TORCH_INDEX_URL: https://download.pytorch.org/whl/cu126
+
+x-accelerator: &accelerator
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: 1
+          capabilities: [gpu]
+
 x-app: &app
-  build: .
+  image: document-rag:cuda
+  build: *build
   env_file:
     - path: .env
       required: false
@@ -20,6 +35,15 @@ x-app: &app
     qdrant:
       condition: service_started
   profiles: [app]
+  mem_limit: 4g
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  tmpfs: ["/tmp:size=512m,mode=1777"]
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
   redis:
@@ -41,17 +65,21 @@ services:
   ollama:
     image: ollama/ollama:0.17.7
     profiles: [inference]
+    deploy: *accelerator
     environment:
       OLLAMA_HOST: 0.0.0.0:11434
       OLLAMA_NO_CLOUD: "1"
       OLLAMA_MAX_LOADED_MODELS: "1"
       OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_KEEP_ALIVE: "0"
+      OLLAMA_KEEP_ALIVE: ${RAG_LLM_KEEP_ALIVE:-5m}
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: f16
     ports: ["127.0.0.1:11434:11434"]
     volumes: ["ollama:/root/.ollama"]
 
   api:
     <<: *app
+    deploy: *accelerator
     ports: ["127.0.0.1:8000:8000"]
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
@@ -61,10 +89,12 @@ services:
 
   worker:
     <<: *app
+    deploy: *accelerator
     command: [celery, -A, app.workers.celery_app:celery_app, worker, --loglevel=INFO]
 
   scheduler:
     <<: *app
+    mem_limit: 512m
     command: [celery, -A, app.workers.celery_app:celery_app, beat, --loglevel=INFO, --schedule=/data/documents/celerybeat-schedule]
 
 volumes:

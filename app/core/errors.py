@@ -21,6 +21,7 @@ class ServiceUnavailable(ApplicationError):
 class InvalidGeneration(ApplicationError):
     """Отклоняет ответ, который не прошёл обязательную проверку."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, correction_feedback: dict[str, str] | None = None) -> None:
         super().__init__("invalid_generation", "Не удалось получить проверенный ответ.", 502)
         self.reason = reason
+        self.correction_feedback = correction_feedback

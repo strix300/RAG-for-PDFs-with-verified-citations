@@ -36,10 +36,15 @@ def build_resources(settings: Settings) -> Resources:
     state = TaskState(settings)
     chat = LocalChat(settings)
     return Resources(
-        settings=settings, store=store, state=state,
+        settings=settings,
+        store=store,
+        state=state,
         documents=DocumentService(settings, store, state, FileStore(settings), enqueue_indexing),
         answers=AnsweringService(
-            settings, store, state,
-            AnswerGenerator(settings, chat), GroundingVerifier(settings, chat),
+            settings,
+            store,
+            state,
+            AnswerGenerator(settings, chat),
+            GroundingVerifier(settings, chat),
         ),
     )

@@ -6,8 +6,10 @@ import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
+from typing import cast
 from uuid import UUID
 
+from filelock import FileLock, Timeout
 from redis import Redis
 from redis.exceptions import LockError, RedisError
 
@@ -97,8 +99,10 @@ class TaskState:
     def __init__(self, settings: Settings, redis: Redis | None = None) -> None:
         self.settings = settings
         self.redis = redis or Redis.from_url(
-            settings.state_redis_url, decode_responses=True,
-            socket_timeout=settings.redis_timeout, socket_connect_timeout=settings.redis_timeout,
+            settings.state_redis_url,
+            decode_responses=True,
+            socket_timeout=settings.redis_timeout,
+            socket_connect_timeout=settings.redis_timeout,
         )
         self.prefix = settings.redis_prefix
 
@@ -113,8 +117,13 @@ class TaskState:
         """Регистрирует задание до отправки в брокер, сохраняя существующее состояние."""
         try:
             self.redis.eval(
-                REGISTER_TASK, 2, self._key(task.task_id), f"{self.prefix}:active",
-                task.model_dump_json(), task.updated_at.timestamp(), str(task.task_id),
+                REGISTER_TASK,
+                2,
+                self._key(task.task_id),
+                f"{self.prefix}:active",
+                task.model_dump_json(),
+                str(task.updated_at.timestamp()),
+                str(task.task_id),
             )
         except RedisError as exc:
             raise ServiceUnavailable("Redis") from exc
@@ -124,10 +133,16 @@ class TaskState:
         task.updated_at = datetime.now(UTC)
         try:
             self.redis.eval(
-                SAVE_TASK, 2, self._key(task.task_id), f"{self.prefix}:active",
-                task.model_dump_json(), task.updated_at.timestamp(),
-                int(task.status in TERMINAL_STATUSES), task.attempt,
-                self.settings.terminal_task_ttl, str(task.task_id),
+                SAVE_TASK,
+                2,
+                self._key(task.task_id),
+                f"{self.prefix}:active",
+                task.model_dump_json(),
+                str(task.updated_at.timestamp()),
+                str(int(task.status in TERMINAL_STATUSES)),
+                str(task.attempt),
+                str(self.settings.terminal_task_ttl),
+                str(task.task_id),
             )
         except RedisError as exc:
             raise ServiceUnavailable("Redis") from exc
@@ -135,7 +150,7 @@ class TaskState:
     def get(self, task_id: UUID) -> TaskRecord | None:
         """Отличает отсутствующее задание от реального ожидающего задания."""
         try:
-            record = self.redis.get(self._key(task_id))
+            record = cast(str | None, self.redis.get(self._key(task_id)))
         except RedisError as exc:
             raise ServiceUnavailable("Redis") from exc
         return TaskRecord.model_validate_json(record) if record is not None else None
@@ -145,7 +160,10 @@ class TaskState:
         if not task_ids:
             return []
         try:
-            records = self.redis.mget([self._key(task_id) for task_id in task_ids])
+            records = cast(
+                list[str | None],
+                self.redis.mget([self._key(task_id) for task_id in task_ids]),
+            )
         except RedisError as exc:
             raise ServiceUnavailable("Redis") from exc
         return [TaskRecord.model_validate_json(record) if record else None for record in records]
@@ -154,18 +172,24 @@ class TaskState:
         """Выбирает ограниченную порцию заданий для восстановления после сбоев."""
         try:
             identifiers = self.redis.zrangebyscore(
-                f"{self.prefix}:active", "-inf",
-                time.time() - self.settings.stale_task_seconds, start=0, num=100,
+                f"{self.prefix}:active",
+                "-inf",
+                time.time() - self.settings.stale_task_seconds,
+                start=0,
+                num=self.settings.reconciliation_batch_size,
             )
         except RedisError as exc:
             raise ServiceUnavailable("Redis") from exc
-        records = self.get_many([UUID(value) for value in identifiers])
+        records = self.get_many([UUID(value) for value in cast(list[str], identifiers)])
         return [record for record in records if record]
 
     def document_lease(self, doc_id: UUID, wait: float = 0) -> Lease:
         """Сериализует изменение и удаление одного документа."""
         return Lease(
-            self.redis, f"{self.prefix}:document:{doc_id}", self.settings.lock_lease_seconds, wait,
+            self.redis,
+            f"{self.prefix}:document:{doc_id}",
+            self.settings.lock_lease_seconds,
+            wait,
         )
 
     @contextmanager
@@ -177,13 +201,17 @@ class TaskState:
         while True:
             for index in range(self.settings.inference_slots):
                 lease = Lease(
-                    self.redis, f"{self.prefix}:inference:{index}",
+                    self.redis,
+                    f"{self.prefix}:inference:{index}",
                     self.settings.lock_lease_seconds,
                 )
                 stack = ExitStack()
                 try:
+                    directory = self.settings.storage_dir / ".locks"
+                    directory.mkdir(parents=True, exist_ok=True)
+                    stack.enter_context(FileLock(directory / f"inference-{index}.lock", timeout=0))
                     stack.enter_context(lease)
-                except ServiceUnavailable:
+                except (ServiceUnavailable, Timeout):
                     stack.close()
                     continue
                 with stack:
@@ -192,19 +220,27 @@ class TaskState:
                 return
             if time.monotonic() >= deadline:
                 raise ServiceUnavailable("очередь локальных моделей")
-            time.sleep(0.1)
+            time.sleep(self.settings.lock_poll_seconds)
 
     def bind_request(
-        self, key: str, signature: str, doc_id: UUID, task_id: UUID,
+        self,
+        key: str,
+        signature: str,
+        doc_id: UUID,
+        task_id: UUID,
     ) -> tuple[UUID, UUID]:
         """Связывает HTTP-ключ с запросом независимо от дедупликации документов."""
-        record = json.dumps({
-            "signature": signature, "doc_id": str(doc_id), "task_id": str(task_id),
-        })
+        record = json.dumps(
+            {
+                "signature": signature,
+                "doc_id": str(doc_id),
+                "task_id": str(task_id),
+            }
+        )
         redis_key = f"{self.prefix}:request:{key}"
         try:
             self.redis.set(redis_key, record, ex=self.settings.idempotency_ttl, nx=True)
-            existing = self.redis.get(redis_key)
+            existing = cast(str | None, self.redis.get(redis_key))
         except RedisError as exc:
             raise ServiceUnavailable("Redis") from exc
         if existing is None:
@@ -212,6 +248,8 @@ class TaskState:
         binding = json.loads(existing)
         if binding["signature"] != signature:
             raise ApplicationError(
-                "idempotency_conflict", "Ключ уже использован для другого запроса.", 409,
+                "idempotency_conflict",
+                "Ключ уже использован для другого запроса.",
+                409,
             )
         return UUID(binding["doc_id"]), UUID(binding["task_id"])

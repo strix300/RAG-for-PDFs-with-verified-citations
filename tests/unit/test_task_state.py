@@ -1,11 +1,12 @@
 """Проверяет TTL и атомарные переходы задания на Redis-совместимом движке."""
 
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
 from app.core.config import Settings
-from app.core.errors import ApplicationError
+from app.core.errors import ApplicationError, ServiceUnavailable
 from app.infrastructure.task_state import TaskState
 from app.models import TaskRecord
 
@@ -38,3 +39,20 @@ def test_idempotency_key_rejects_different_request() -> None:
     assert state.bind_request("key", "signature", uuid4(), uuid4()) == first
     with pytest.raises(ApplicationError, match="Ключ"):
         state.bind_request("key", "different_signature", uuid4(), uuid4())
+
+
+def test_inference_stays_exclusive_after_redis_lock_is_lost(tmp_path: Path) -> None:
+    import fakeredis
+
+    settings = Settings(storage_dir=tmp_path, inference_wait_seconds=0.01, lock_poll_seconds=0.001)
+    redis = fakeredis.FakeRedis(decode_responses=True)
+    first = TaskState(settings, redis)
+    second = TaskState(settings, redis)
+    with pytest.raises(ServiceUnavailable):
+        with first.inference_slot():
+            redis.delete(f"{settings.redis_prefix}:inference:0")
+            with pytest.raises(ServiceUnavailable):
+                with second.inference_slot():
+                    pytest.fail("Потеря Redis-блокировки не должна допускать второй inference")
+    with second.inference_slot() as lease:
+        lease.ensure_owned()

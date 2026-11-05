@@ -15,7 +15,8 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 @router.get("/{task_id}", response_model=TaskRecord)
 def task_status(
-    task_id: UUID, resources: Annotated[Resources, Depends(get_resources)],
+    task_id: UUID,
+    resources: Annotated[Resources, Depends(get_resources)],
 ) -> TaskRecord:
     """Не подменяет неизвестный или истёкший ID фиктивным статусом PENDING."""
     task = resources.state.get(task_id)

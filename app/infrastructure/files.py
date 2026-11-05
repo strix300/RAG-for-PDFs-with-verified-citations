@@ -23,14 +23,19 @@ class FileStore:
         digest = hashlib.sha256()
         total = 0
         with tempfile.NamedTemporaryFile(
-            dir=self.root, prefix="upload-", suffix=".tmp", delete=False,
+            dir=self.root,
+            prefix="upload-",
+            suffix=".tmp",
+            delete=False,
         ) as target:
             path = Path(target.name)
             try:
                 while block := stream.read(1024 * 1024):
                     if total == 0 and not block.startswith(b"%PDF-"):
                         raise ApplicationError(
-                            "unsupported_format", "Поддерживаются только PDF.", 415,
+                            "unsupported_format",
+                            "Поддерживаются только PDF.",
+                            415,
                         )
                     total += len(block)
                     if total > self.max_bytes:

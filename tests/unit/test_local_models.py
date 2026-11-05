@@ -18,7 +18,8 @@ def test_model_alias_must_resolve_to_local_weights(remote: bool) -> None:
         return httpx.Response(200, json=metadata)
 
     with httpx.Client(
-        base_url="http://localhost:11434", transport=httpx.MockTransport(show),
+        base_url="http://localhost:11434",
+        transport=httpx.MockTransport(show),
     ) as client:
         if remote:
             with pytest.raises(ApplicationError) as error:

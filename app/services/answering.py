@@ -10,7 +10,7 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from app.api.schemas import AnswerResponse, Citation, Diagnostics
+from app.contracts import AnswerResponse, Citation, Diagnostics
 from app.core.config import Settings
 from app.core.constants import NOT_FOUND_ANSWER
 from app.core.errors import ApplicationError, InvalidGeneration
@@ -43,23 +43,37 @@ def build_response(draft: DraftAnswer, context: list[Candidate]) -> AnswerRespon
             seen.add(key)
             source = fragments[evidence.fragment_id]
             start = source.char_start + source.text.index(evidence.quote)
-            citations.append(Citation(
-                fragment_id=evidence.fragment_id, doc_id=source.doc_id, doc_title=source.doc_title,
-                text=evidence.quote, page=source.page_from, section=source.section,
-                char_start=start, char_end=start + len(evidence.quote),
-            ))
+            citations.append(
+                Citation(
+                    fragment_id=evidence.fragment_id,
+                    doc_id=source.doc_id,
+                    doc_title=source.doc_title,
+                    text=evidence.quote,
+                    page=source.page_from,
+                    section=source.section,
+                    char_start=start,
+                    char_end=start + len(evidence.quote),
+                )
+            )
     return AnswerResponse(
-        answer=" ".join(claim.text for claim in draft.claims), found=True, citations=citations,
+        answer=" ".join(claim.text for claim in draft.claims),
+        found=True,
+        citations=citations,
     )
 
 
 def generate_verified_answer(
-    generator: AnswerGenerator, verifier: GroundingVerifier, question: str,
-    context: list[Candidate], deadline: float, timings: dict[str, float],
-    *, trace: AnswerTrace | None = None,
+    generator: AnswerGenerator,
+    verifier: GroundingVerifier,
+    question: str,
+    context: list[Candidate],
+    deadline: float,
+    timings: dict[str, float],
+    *,
+    trace: AnswerTrace | None = None,
 ) -> AnswerResponse:
     """Разрешает ровно одну коррекцию, повторяя после неё весь цикл проверок."""
-    correction: str | None = None
+    correction: str | dict[str, str] | None = None
     trace = trace if trace is not None else AnswerTrace(timings)
     for attempt in range(2):
         trace.attempt = attempt + 1
@@ -81,20 +95,27 @@ def generate_verified_answer(
             return response
         except (ValidationError, InvalidGeneration) as exc:
             reason = (
-                exc.reason if isinstance(exc, InvalidGeneration)
-                else json.dumps(exc.errors(include_input=False, include_context=False,
-                                           include_url=False), ensure_ascii=False)
+                exc.reason
+                if isinstance(exc, InvalidGeneration)
+                else json.dumps(
+                    exc.errors(include_input=False, include_context=False, include_url=False),
+                    ensure_ascii=False,
+                )
             )
             logger.warning(
                 "answer_rejected request_id=%s attempt=%s stage=%s reason=%s",
-                trace.request_id, trace.attempt, trace.failed_stage, reason,
+                trace.request_id,
+                trace.attempt,
+                trace.failed_stage,
+                reason,
             )
             if attempt == 1:
                 raise InvalidGeneration(
                     "Ответ не прошёл проверку после единственной коррекции.",
                 ) from exc
             correction = (
-                exc.reason if isinstance(exc, InvalidGeneration)
+                (exc.correction_feedback or exc.reason)
+                if isinstance(exc, InvalidGeneration)
                 else "Исправь структуру JSON по заданной схеме."
             )
     raise RuntimeError("Проверка завершилась без результата.")
@@ -104,8 +125,12 @@ class AnsweringService:
     """Оркестрирует pipeline без истории запросов и дополнительных источников."""
 
     def __init__(
-        self, settings: Settings, store: QdrantStore, state: TaskState,
-        generator: AnswerGenerator, verifier: GroundingVerifier,
+        self,
+        settings: Settings,
+        store: QdrantStore,
+        state: TaskState,
+        generator: AnswerGenerator,
+        verifier: GroundingVerifier,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -122,60 +147,81 @@ class AnsweringService:
         try:
             if not question.strip() or len(question) > self.settings.question_max_chars:
                 raise ApplicationError(
-                    "invalid_question", "Вопрос пуст или превышает допустимый размер.",
+                    "invalid_question",
+                    "Вопрос пуст или превышает допустимый размер.",
                 )
             document = self.store.get_document(doc_id)
             if document is None or document.deleting:
                 raise ApplicationError("document_not_found", "Документ не найден.", 404)
             if document.active_generation is None:
                 raise ApplicationError(
-                    "document_not_ready", "Индексация документа ещё не завершена.", 409,
+                    "document_not_ready",
+                    "Индексация документа ещё не завершена.",
+                    409,
                 )
             if document.active_profile != self.settings.index_profile():
                 raise ApplicationError(
-                    "index_profile_changed", "Требуется контролируемая переиндексация.", 409,
+                    "index_profile_changed",
+                    "Требуется контролируемая переиндексация.",
+                    409,
                 )
             with self.state.inference_slot() as inference:
                 with measure(timings, "query_embedding"):
                     with LocalEmbeddings(self.settings) as embeddings:
                         dense, sparse = embeddings.embed_question(question)
                 check_deadline(deadline)
+                inference.ensure_owned()
                 with measure(timings, "retrieval"):
                     candidates, counts = self.store.retrieve(
-                        doc_id, document.active_generation, dense, sparse, diagnostics,
+                        doc_id,
+                        document.active_generation,
+                        dense,
+                        sparse,
+                        diagnostics,
                     )
                 with measure(timings, "reranking"):
+                    inference.ensure_owned()
                     ranked = LocalReranker(self.settings).rerank(question, candidates)
-                selected = ranked[:self.settings.reranker_output_limit]
+                selected = ranked[: self.settings.reranker_output_limit]
                 context: list[Candidate] = []
-                used = 0
                 for candidate in selected:
-                    size = len(candidate.chunk.text.encode("utf-8")) + 100
-                    if used + size > self.settings.context_max_bytes:
-                        break
-                    context.append(candidate)
-                    used += size
+                    if self.generator.context_fits(question, [*context, candidate]):
+                        context.append(candidate)
                 if candidates and not context:
                     raise ApplicationError(
-                        "context_budget", "Ни один фрагмент не помещается в контекст.", 422,
+                        "context_budget",
+                        "Ни один фрагмент не помещается в контекст.",
+                        422,
                     )
                 inference.ensure_owned()
                 response = generate_verified_answer(
-                    self.generator, self.verifier, question, context, deadline, timings,
+                    self.generator,
+                    self.verifier,
+                    question,
+                    context,
+                    deadline,
+                    timings,
                     trace=trace,
                 )
                 inference.ensure_owned()
             timings["total"] = (perf_counter() - started) * 1000
             if diagnostics:
                 response.diagnostics = Diagnostics(
-                    **counts, rerank_input_candidates=len(ranked),
+                    dense_candidates=counts["dense_candidates"],
+                    sparse_candidates=counts["sparse_candidates"],
+                    fusion_candidates=counts["fusion_candidates"],
+                    rerank_input_candidates=len(ranked),
                     rerank_output_candidates=len(selected),
-                    reranked_candidates=ranked, context_fragments=context, timings_ms=timings,
+                    reranked_candidates=ranked,
+                    context_fragments=context,
+                    timings_ms=timings,
                 )
             return response
         finally:
             timings["total"] = (perf_counter() - started) * 1000
             logger.info(
                 "answer_timing request_id=%s doc_id=%s timings_ms=%s",
-                trace.request_id, doc_id, json.dumps(timings),
+                trace.request_id,
+                doc_id,
+                json.dumps(timings),
             )

@@ -6,10 +6,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Form, Header, Query, Response, UploadFile
 
 from app.api.dependencies import get_resources
-from app.api.schemas import DocumentPage, Submission
 from app.bootstrap import Resources
-from app.core.errors import ApplicationError
-from app.infrastructure.files import FileStore
+from app.contracts import DocumentPage, Submission
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 Dependencies = Annotated[Resources, Depends(get_resources)]
@@ -17,7 +15,9 @@ Dependencies = Annotated[Resources, Depends(get_resources)]
 
 @router.post("", status_code=202, response_model=Submission)
 def upload_document(
-    file: UploadFile, resources: Dependencies, title: Annotated[str | None, Form()] = None,
+    file: UploadFile,
+    resources: Dependencies,
+    title: Annotated[str | None, Form()] = None,
     idempotency_key: Annotated[str | None, Header(max_length=200)] = None,
 ) -> Submission:
     """Сохраняет PDF и запускает фоновую индексацию."""
@@ -27,7 +27,8 @@ def upload_document(
 
 @router.get("", response_model=DocumentPage)
 def list_documents(
-    resources: Dependencies, limit: Annotated[int, Query(ge=1, le=1000)] = 20,
+    resources: Dependencies,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 20,
     cursor: UUID | None = None,
 ) -> DocumentPage:
     """Возвращает страницу каталога, включая ещё не проиндексированные документы."""
@@ -37,16 +38,5 @@ def list_documents(
 @router.delete("/{doc_id}", status_code=204)
 def delete_document(doc_id: UUID, resources: Dependencies) -> Response:
     """Явно удаляет исходный файл и все поколения; повторное удаление безопасно."""
-    with resources.state.document_lease(doc_id, wait=5) as lease:
-        document = resources.store.get_document(doc_id)
-        if document is not None:
-            task = resources.state.get(document.task_id)
-            if task and task.status in {"queued", "running", "retrying"}:
-                raise ApplicationError(
-                    "indexing_active", "Удаление возможно после завершения индексации.", 409,
-                )
-            resources.store.mark_deleting(doc_id)
-        FileStore(resources.settings).delete(doc_id)
-        lease.ensure_owned()
-        resources.store.delete_document(doc_id)
+    resources.documents.delete(doc_id)
     return Response(status_code=204)

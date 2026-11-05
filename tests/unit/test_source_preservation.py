@@ -17,13 +17,17 @@ def test_page_boundaries_sections_and_overlapping_offsets() -> None:
         Page(number=2, text=second, char_start=len(first) + 1),
     ]
     document = DocumentRecord(
-        doc_id=uuid4(), doc_title="Договор", content_hash="hash", task_id=uuid4(),
-        pending_generation=uuid4(), index_profile="profile",
+        doc_id=uuid4(),
+        doc_title="Договор",
+        content_hash="hash",
+        task_id=uuid4(),
+        pending_generation=uuid4(),
+        index_profile="profile",
     )
     chunks = split_pages(pages, document, Settings(chunk_tokens=50, chunk_overlap_tokens=10), len)
     assert {chunk.page_from for chunk in chunks} == {1, 2}
     assert all(chunk.page_from == chunk.page_to for chunk in chunks)
-    assert all(full[chunk.char_start:chunk.char_end] == chunk.text for chunk in chunks)
+    assert all(full[chunk.char_start : chunk.char_end] == chunk.text for chunk in chunks)
     assert [chunk.chunk_index for chunk in chunks] == list(range(len(chunks)))
     assert all(chunk.section == "4.2 Штрафные санкции" for chunk in chunks)
     assert chunks[-1].char_end == len(full)
@@ -32,14 +36,20 @@ def test_page_boundaries_sections_and_overlapping_offsets() -> None:
 def test_repeated_text_does_not_shift_offsets_backwards() -> None:
     text = "Повторяемая строка. " * 20
     document = DocumentRecord(
-        doc_id=uuid4(), doc_title="Договор", content_hash="hash", task_id=uuid4(),
-        pending_generation=uuid4(), index_profile="profile",
+        doc_id=uuid4(),
+        doc_title="Договор",
+        content_hash="hash",
+        task_id=uuid4(),
+        pending_generation=uuid4(),
+        index_profile="profile",
     )
     chunks = split_pages(
-        [Page(number=1, text=text, char_start=0)], document,
-        Settings(chunk_tokens=50, chunk_overlap_tokens=10), len,
+        [Page(number=1, text=text, char_start=0)],
+        document,
+        Settings(chunk_tokens=50, chunk_overlap_tokens=10),
+        len,
     )
     assert chunks[-1].char_end == len(text)
     for previous, current in zip(chunks, chunks[1:], strict=False):
         assert previous.char_end - current.char_start <= 10
-        assert not text[previous.char_end:current.char_start].strip()
+        assert not text[previous.char_end : current.char_start].strip()

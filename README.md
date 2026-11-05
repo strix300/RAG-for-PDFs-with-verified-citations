@@ -6,22 +6,48 @@ FastAPI принимает PDF до 100 страниц. Celery индексир�
 переранжирования. Каждое утверждение проходит проверку цитат и отдельный вызов
 локальной LLM-проверяющего. Истории диалога нет.
 
-## Модели и память
+## Системные требования
+
+Ориентиры для текущей конфигурации с контекстом 16384 токена и одним одновременно
+выполняемым pipeline:
+
+| Ресурс | Требование |
+|---|---|
+| CPU | От 4 ядер |
+| RAM | От 16 ГБ; для разработки и сборки рекомендуется 24–32 ГБ |
+| GPU | Поддержка CUDA 12.6, от 10 ГБ видеопамяти |
+| Диск | От 40 ГБ свободного места для образов, весов и данных |
+| Среда запуска | Linux с Docker Engine или Windows с Docker Desktop и WSL2, Linux-контейнеры |
+| Docker Compose | v2.24+ |
+| Python для нативной разработки | 3.12 |
+
+Это ориентиры по ресурсам, а не измеренные минимумы или SLA. Расход памяти зависит
+от контекста, размера документов и других процессов. В Docker Desktop учитывайте
+отдельный лимит памяти WSL2 и оставляйте ресурсы операционной системе.
+Драйвер с поддержкой CUDA 12.6 устанавливается на хосте. На Linux для доступа
+контейнеров к GPU нужен
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html);
+на Windows — поддержка GPU в WSL2.
+См. [GPU в Docker Desktop](https://docs.docker.com/desktop/features/gpu/) и
+[выделение GPU в Compose](https://docs.docker.com/compose/how-tos/gpu-support/).
+
+## Модели и конфигурация
 
 | Этап | Модель по умолчанию | Runtime |
 |---|---|---|
-| Dense | `intfloat/multilingual-e5-small`, 384 измерения | LangChain HuggingFaceEmbeddings, Sentence Transformers/PyTorch |
-| Sparse | `Qdrant/bm25`, русский stemmer | LangChain FastEmbedSparse, FastEmbed; IDF в Qdrant |
-| Реранкер | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Sentence Transformers CrossEncoder |
-| Генерация | `qwen3:4b` | Локальный Ollama, LangChain ChatOllama |
-| Семантическая проверка | `qwen3:4b` | Отдельный вызов и отдельный GroundingVerifier |
+| Dense | `intfloat/multilingual-e5-small`, 384 измерения | LangChain HuggingFaceEmbeddings, Sentence Transformers/PyTorch, CUDA FP32 |
+| Sparse | `Qdrant/bm25`, русский stemmer | LangChain FastEmbedSparse, FastEmbed, CPU; IDF в Qdrant |
+| Реранкер | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Sentence Transformers CrossEncoder, CUDA FP32 |
+| Генерация | `qwen2.5:7b-instruct-q4_K_M` | Локальный Ollama, LangChain ChatOllama |
+| Семантическая проверка | `qwen2.5:7b-instruct-q4_K_M` | Отдельный вызов и отдельный GroundingVerifier |
 
-E5-small и multilingual MiniLM выбраны вместо более крупных моделей ради памяти и
-CPU-совместимости. E5 получает обязательные `query: ` / `passage: ` префиксы, включая
-русские тексты. BM25 — именно алгоритм BM25, а не learned sparse representation E5/BGE.
-Документы и вопросы могут быть многоязычными; автоматического перевода нет.
+E5 получает обязательные `query: ` / `passage: ` префиксы, включая русские тексты.
+BM25 — алгоритм BM25. Документы и вопросы могут быть многоязычными;
+автоматического перевода нет. Все модели и лимиты настраиваются в `app/core/config.py`
+и через `.env`; полный пример текущей конфигурации — `.env.example`.
 
-Все вычисления локальны. Платные API, API keys и облачные модели не используются.
+Все вычисления локальны. Платные API и облачные модели не используются.
+`RAG_API_KEY` защищает собственный HTTP API; он не связан с оплатой моделей.
 Интернет нужен только для установки зависимостей и явной загрузки публичных весов.
 При запросах используются локальные каталоги и `local_files_only=True`; tracing
 LangSmith отключён на границе вызова LLM. Публичные Ollama endpoints и cloud-теги
@@ -29,79 +55,88 @@ LangSmith отключён на границе вызова LLM. Публичн�
 включая локально названный alias; при отсутствии локальных model metadata запрос отклоняется.
 Compose фиксирует Ollama `0.17.7` и отключает cloud-функции через `OLLAMA_NO_CLOUD=1`.
 
-По умолчанию CPU включён явно: `RAG_MODEL_DEVICE=cpu`, `RAG_OLLAMA_NUM_GPU=0`.
+По умолчанию `RAG_MODEL_DEVICE=cuda`, `RAG_OLLAMA_NUM_GPU=-1`.
+PyTorch зафиксирован на 2.14.1 / CUDA 12.6. API, worker и Ollama получают доступ к GPU;
+scheduler использует тот же образ приложения без выделения GPU.
 Веса dense и реранкера загружаются последовательно и освобождаются после этапа.
-Ollama получает `keep_alive=0`. Redis ограничивает суммарное число inference pipeline
-между API и worker: `RAG_INFERENCE_SLOTS=1`. Повышение этого значения повышает расход памяти.
+Ollama сохраняет LLM в памяти на 5 минут, поэтому генерация и verifier используют
+одни загруженные веса. Это кеш модели; каждый вопрос обрабатывается независимо.
+
+Контекст — 16384 токена, максимальный вывод — 1200 токенов, лимит фрагментов — 8000 байт.
+Это ограничения памяти и длины запроса. Перед вызовом учитывается полный запрос:
+инструкции, вопрос, JSON Schema и фактическое представление фрагментов.
+Flash Attention включён, KV cache — `f16`. Batch dense — 16, реранкера — 8.
+Redis и файловая блокировка в общем томе ограничивают число inference pipeline между API и worker:
+`RAG_INFERENCE_SLOTS=1`. Параллелизм Ollama, число загруженных LLM и worker concurrency
+тоже равны 1. Повышение лимитов увеличивает расход памяти.
 Один pipeline может ждать свободного слота только ограниченное время.
-
-Плановые аппаратные ориентиры, **не измеренные минимумы и не SLA**:
-
-| Профиль | RAM | CPU | Свободное место |
-|---|---|---|---|
-| Малый, Qwen3 1.7B | от 8 ГБ; 12 ГБ предпочтительнее при Docker Desktop | 2–4 ядра | от 15 ГБ |
-| Основной, Qwen3 4B | 16–24 ГБ; целевая машина — M3 Pro / 18 ГБ | от 4 ядер | от 20 ГБ |
-
-Расход зависит от размера контекста, контейнеров и других процессов. Фактические
-показатели получают командой `scripts/smoke.py`; цифры скорости здесь не выдуманы.
 
 Источники: [E5-small](https://huggingface.co/intfloat/multilingual-e5-small),
 [реранкер](https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1),
-[Qwen3](https://ollama.com/library/qwen3),
+[Qwen2.5 7B Instruct Q4_K_M](https://ollama.com/library/qwen2.5:7b-instruct-q4_K_M),
 [структурированный вывод Ollama](https://docs.ollama.com/capabilities/structured-outputs).
 
-## Запуск в Docker: macOS, Linux, Windows
+## Запуск в Docker
 
-Нужен Docker Compose v2.24+; на Windows — Docker Desktop с WSL2/Linux containers.
-Celery не поддерживает нативный Windows worker; поддерживаемый путь — Linux-контейнер
-или WSL2. GPU для запуска не нужен. На macOS контейнерный вариант использует CPU;
-опциональная работа с нативным Ollama описана ниже.
+Из корня репозитория:
 
 ```sh
 cp .env.example .env
 docker compose --profile app --profile inference build
+docker run --rm -v "${PWD}:/workspace" -w /workspace document-rag:cuda rag init-api-key
 docker compose --profile inference up -d redis qdrant ollama
 docker compose --profile app run --rm api rag download-models
 docker compose --profile app run --rm api rag init
-docker compose --profile app --profile inference up -d
-docker compose --profile app exec api rag doctor
+docker compose --profile app --profile inference up -d --no-build
+docker compose exec -T api rag doctor
 ```
 
 В PowerShell вместо `cp` можно использовать `Copy-Item .env.example .env`.
+Если `.env` уже существует, перенесите нужные параметры из примера, сохранив свои настройки.
+Итоговую конфигурацию проверяют командой
+`docker compose --profile app --profile inference config`.
 `download-models` скачивает все четыре набора весов, включая обе настроенные LLM,
 через локальный Ollama. Если генератор и verifier используют одну модель, повторной
 загрузки весов нет. Каталоги Docker volumes `models` и `ollama` сохраняются между
 перезапусками. `rag doctor` проверяет хранилища и наличие моделей; это не тест качества ответов.
 
+Проверка доступа контейнеров к GPU:
+
+```sh
+docker compose exec -T ollama nvidia-smi
+docker compose exec -T api python -c "import torch; assert torch.cuda.is_available(); print(torch.__version__)"
+docker compose exec -T ollama ollama ps
+```
+
+После запроса `ollama ps` должен показывать `100% GPU`, а логи Ollama — полное
+размещение слоёв на GPU. `num_gpu=-1` сам по себе не подтверждает фактическое размещение.
+
 API: `http://localhost:8000`, OpenAPI: `/docs`. Порты Redis, Qdrant и Ollama привязаны
 к loopback хоста. Не используйте `docker compose down -v`, если нужно сохранить документы:
 эта команда явно удаляет все volumes.
 
-Compose фиксирует Qdrant `1.17.0` и совместимую ветку клиента `1.17.x`. Остальные Python
-зависимости имеют ограниченные диапазоны в `pyproject.toml`. Полный lock-файл пока не
-предоставлен. Для воспроизведения конкретной сборки сохраните фактически установленный
-набор через `docker compose exec -T api python -m pip freeze`. Диапазоны зависимостей
-сами по себе не гарантируют одинаковый набор при последующей пересборке.
+Compose фиксирует Qdrant `1.17.0` и совместимую ветку клиента `1.17.x`.
+Проверенные Python-зависимости фиксируются в `requirements.lock`; Docker использует этот
+набор при сборке. Обновлять lock следует вместе с проверками моделей и аудитом зависимостей.
 
 ## Нативная разработка
 
-Поддерживаемый Python — **3.12**. Python 3.13 не является целевой средой полного стека,
-в частности из-за ограничений выбранной интеграции FastEmbed.
+Поддерживаемый Python — **3.12**. Для Celery worker нужна Linux-среда; на Windows
+используйте WSL2. Команды ниже рассчитаны на Linux/WSL2:
 
 ```sh
 python3.12 -m venv .venv
 source .venv/bin/activate
+python -m pip install 'torch==2.14.1' --index-url https://download.pytorch.org/whl/cu126
 python -m pip install -e '.[dev]'
 cp .env.example .env
+rag init-api-key
 docker compose up -d redis qdrant
-OLLAMA_NO_CLOUD=1 OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_NUM_PARALLEL=1 ollama serve
+OLLAMA_NO_CLOUD=1 OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_NUM_PARALLEL=1 OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=f16 OLLAMA_KEEP_ALIVE=5m ollama serve
 ```
 
 `ollama serve` запускается в отдельном терминале. Если Ollama уже работает как приложение,
-второй сервер запускать не нужно.
-Для уже запущенного приложения отключите cloud-функции в настройках сервера и перезапустите
-его согласно [инструкции Ollama](https://github.com/ollama/ollama/blob/main/docs/faq.mdx).
-Затем:
+используйте существующий сервер с такими же настройками. Затем:
 
 ```sh
 rag download-models
@@ -117,75 +152,20 @@ celery -A app.workers.celery_app:celery_app worker --loglevel=INFO
 celery -A app.workers.celery_app:celery_app beat --loglevel=INFO --schedule=.data/celerybeat-schedule
 ```
 
-На Linux для гарантированно CPU-варианта PyTorch его можно установить первым:
-
-```sh
-python -m pip install 'torch>=2.6,<3' --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -e '.[dev]'
-```
-
-Для ручной загрузки LLM эквивалентны `ollama pull qwen3:4b` и, при малом профиле,
-`ollama pull qwen3:1.7b`; `rag download-models` дополнительно загружает E5, реранкер и BM25.
+Для ручной загрузки LLM: `ollama pull qwen2.5:7b-instruct-q4_K_M`.
+`rag download-models` дополнительно загружает E5, реранкер и BM25.
 Весам не нужны приватные credentials. Настройка `RAG_MODEL_CACHE_DIR` задаёт постоянный
 каталог. Если ID или revision модели меняется, используйте новый каталог кеша и
 контролируемую переиндексацию; существующий кеш не перезаписывается молча.
 
-На M3 можно оставить API/worker в контейнерах, а Ollama запустить нативно. Добавьте
-в `.env` `RAG_CONTAINER_OLLAMA_URL=http://host.docker.internal:11434`, не запускайте
-Compose-профиль `inference`, обеспечьте доступ контейнеров к локальному Ollama.
-Дополнительное ускорение: `RAG_OLLAMA_NUM_GPU=-1`; для нативного PyTorch доступны
-`RAG_MODEL_DEVICE=mps` или `cuda` при наличии соответствующего backend. CPU остаётся
-полностью поддерживаемым вариантом. Контейнеры проекта намеренно собираются с CPU PyTorch.
-
-[Ollama FAQ](https://docs.ollama.com/faq) подтверждает, что стандартный контейнер Ollama
-в Docker Desktop на macOS не получает GPU passthrough. `num_gpu=-1` внутри этого
-контейнера не включает Metal. Ускорение требует нативного сервера на хосте.
-Для проверки отдельного сервера без изменения работающего Compose:
-
-```sh
-OLLAMA_HOST=127.0.0.1:11435 OLLAMA_MODELS="$PWD/.data/native-ollama" \
-  OLLAMA_NO_CLOUD=1 OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_NUM_PARALLEL=1 \
-  OLLAMA_KEEP_ALIVE=0 ollama serve
-```
-
-В другом терминале: `OLLAMA_HOST=127.0.0.1:11435 ollama pull qwen3:4b`.
-Для явного переключения API задайте в `.env`
-`RAG_CONTAINER_OLLAMA_URL=http://host.docker.internal:11435` и `RAG_OLLAMA_NUM_GPU=-1`,
-затем пересоздайте API. Сначала проверьте доступ контейнера к `/api/version` этого адреса.
-В проведённом тесте loopback-привязка хоста была доступна через Docker Desktop;
-не открывайте сервер на всех сетевых интерфейсах без необходимости.
-`OLLAMA_MODELS` — постоянный каталог весов нативного сервера, независимый от Docker volume.
-Параметры основного CPU-профиля и модели по умолчанию автоматически не меняются.
-
-## Малый профиль
-
-Измените значения в `.env` **до первой индексации**:
-
-```dotenv
-RAG_GENERATION_MODEL=qwen3:1.7b
-RAG_VERIFICATION_MODEL=qwen3:1.7b
-RAG_OLLAMA_CONTEXT_TOKENS=8192
-RAG_CONTEXT_MAX_BYTES=1800
-RAG_LLM_OUTPUT_TOKENS=500
-RAG_QUESTION_MAX_CHARS=500
-RAG_CHUNK_TOKENS=160
-RAG_CHUNK_OVERLAP_TOKENS=24
-RAG_DENSE_CANDIDATES=20
-RAG_SPARSE_CANDIDATES=20
-RAG_FUSED_CANDIDATES=10
-RAG_RERANKER_INPUT_LIMIT=10
-RAG_RERANKER_OUTPUT_LIMIT=2
-RAG_EMBEDDING_BATCH_SIZE=2
-RAG_RERANKER_BATCH_SIZE=1
-RAG_INFERENCE_THREADS=2
-RAG_INFERENCE_SLOTS=1
-```
-
-После изменения выполните `rag download-models` и перезапустите процессы. Малый профиль
-имеет меньший контекст и потенциально более низкое качество; pipeline проверки не
-отключается и неподтверждённые ответы не выдаются. Изменение chunking требует reindex.
-
 ## API
+
+Запросы к документам и задачам требуют `Authorization: Bearer <RAG_API_KEY>`.
+Ключ создаётся командой `rag init-api-key` и сохраняется в локальном `.env` без вывода
+в терминал. Повтор команды сохраняет существующий ключ. Без ключа API не запускается.
+Все обладатели ключа имеют доступ ко всем документам одной установки. В `/docs` ключ
+вводится через **Authorize**. `/health/live` и `/health/ready` доступны без ключа.
+В примерах переменная оболочки `RAG_API_KEY` должна содержать значение из `.env`.
 
 Все UUID в примерах заменяются полученными значениями. Примеры JSON ниже показывают
 контракт, **а не результат выполненного inference в текущей среде**.
@@ -194,6 +174,7 @@ RAG_INFERENCE_SLOTS=1
 
 ```sh
 curl -X POST http://localhost:8000/documents \
+  -H "Authorization: Bearer $RAG_API_KEY" \
   -H 'Idempotency-Key: upload-contract-001' \
   -F 'title=Договор поставки' -F 'file=@contract.pdf;type=application/pdf'
 ```
@@ -217,8 +198,8 @@ curl -X POST http://localhost:8000/documents \
 ### Статус и список
 
 ```sh
-curl http://localhost:8000/tasks/TASK_ID
-curl 'http://localhost:8000/documents?limit=20'
+curl -H "Authorization: Bearer $RAG_API_KEY" http://localhost:8000/tasks/TASK_ID
+curl -H "Authorization: Bearer $RAG_API_KEY" 'http://localhost:8000/documents?limit=20'
 ```
 
 Статусы: `queued`, `running`, `retrying`, `succeeded`, `failed`. Ответ содержит `stage`,
@@ -234,6 +215,7 @@ curl 'http://localhost:8000/documents?limit=20'
 
 ```sh
 curl -X POST 'http://localhost:8000/documents/DOC_ID/questions?diagnostics=true' \
+  -H "Authorization: Bearer $RAG_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"question":"Какова неустойка по пункту 4.2?"}'
 ```
@@ -276,13 +258,14 @@ curl -X POST 'http://localhost:8000/documents/DOC_ID/questions?diagnostics=true'
 Дополнительные запросы измеряют ветви повторно, с теми же фильтрами и лимитами; их
 результаты **никогда** не используются для генерации. Это не telemetry исходного prefetch.
 Время `retrieval` при включённой диагностике включает эти дополнительные измерения.
-Без диагностики выполняется ровно один retrieval query с двумя Prefetch и RRF.
+Без диагностики выполняется ровно один retrieval query с двумя Prefetch и FusionQuery.
+`RAG_FUSION=rrf` выбирает RRF, `RAG_FUSION=dbsf` — DBSF.
 Чтение каталога по ID является отдельной metadata-операцией, не поисковой ветвью.
 
 ### Явное удаление
 
 ```sh
-curl -X DELETE http://localhost:8000/documents/DOC_ID
+curl -X DELETE -H "Authorization: Bearer $RAG_API_KEY" http://localhost:8000/documents/DOC_ID
 ```
 
 `204` удаляет оригинал, каталог и все поколения. Активное индексирование защищено
@@ -290,32 +273,61 @@ curl -X DELETE http://localhost:8000/documents/DOC_ID
 Источники и индексированные данные не удаляются автоматически. Терминальные task
 records по умолчанию хранятся 7 дней (`RAG_TERMINAL_TASK_TTL=604800`); активные — без TTL.
 
-Основные ошибки: `413` — размер upload, `415` — не PDF, `422` — некорректный ввод или
+Основные ошибки: `401` — неверный ключ, `408` — таймаут чтения тела,
+`429` — заняты доступные обработчики, `413` — размер тела, `415` — не PDF,
+`422` — некорректный ввод или
 недопустимый размер контекста, `404` — неизвестный ресурс, `409` — индекс не готов или
 конфликт, `503` — инфраструктура/модель недоступна, `504` — deadline, `502` — ответ не
 прошёл полный цикл проверки. Сбой инфраструктуры никогда не превращается в `found=false`.
 
 ## Проверка и воспроизводимый пример
 
+При установленных зависимостях:
+
 ```sh
 python -m pytest
 python -m ruff check .
 python -m ruff format --check .
+python -m mypy app
+python -m pip check
+python -m pip_audit -r requirements.lock --no-deps --disable-pip
+```
+
+Проверки с настоящими сервисами и моделями включаются явно:
+
+```sh
 RAG_RUN_INTEGRATION=1 python -m pytest tests/integration/test_qdrant.py
 RAG_RUN_STACK_TESTS=1 python -m pytest tests/integration/test_worker.py
 RAG_RUN_MODEL_TESTS=1 python -m pytest tests/integration/test_ollama.py
-python scripts/create_example.py .data/example.pdf
-python scripts/smoke.py .data/example.pdf --output .data/smoke-results.json
+RAG_RUN_GPU_TESTS=1 python -m pytest tests/integration/test_gpu.py
+RAG_RUN_HANDBOOK_TESTS=1 python -m pytest tests/integration/test_handbook.py
 ```
 
-Последние команды требуют запущенного полного стека и установленных Python-зависимостей.
-Для Windows задайте `$env:RAG_RUN_INTEGRATION='1'` / `$env:RAG_RUN_STACK_TESTS='1'`
-перед соответствующей командой. Qdrant-тест создаёт и удаляет собственную коллекцию
-`test_<uuid>`; рабочую коллекцию не трогает. Worker-тест проверяет настоящую асинхронную
-ошибку страницы без текста, не требуя весов.
-Модельные тесты требуют локального Ollama и установленного LangChain SDK: проверяют
-генерацию с полным циклом grounding и отдельно вызывают verifier с подтверждённым тезисом.
-На Windows флаг задаётся как `$env:RAG_RUN_MODEL_TESTS='1'`.
+Для PowerShell задайте соответствующий флаг, например `$env:RAG_RUN_INTEGRATION='1'`,
+перед командой `python -m pytest`. Qdrant-тест создаёт и удаляет собственную коллекцию
+`test_<uuid>`. Worker-тест проверяет асинхронную ошибку страницы без текста.
+Модельные проверки требуют загруженных локальных весов и работающего Ollama.
+`test_gpu.py` проверяет фактическое устройство dense/реранкера, в том числе выполнение
+на CPU, полное размещение LLM на GPU и реальную коррекцию ошибочной цитаты.
+
+Все проверки можно запустить в одноразовом контейнере при работающем стеке.
+PowerShell:
+
+```powershell
+docker compose run --rm --no-deps --user root `
+  -v "${PWD}:/workspace:ro" -v "${PWD}/.data:/results" -e PYTHONPATH=/service `
+  -e RAG_RUN_INTEGRATION=1 -e RAG_RUN_STACK_TESTS=1 -e RAG_RUN_MODEL_TESTS=1 `
+  -e RAG_RUN_GPU_TESTS=1 -e RAG_TEST_API_URL=http://api:8000 `
+  -e RAG_RUN_HANDBOOK_TESTS=1 -e RAG_TEST_REPORT_DIR=/results/handbook/http `
+  api sh -c "pip install 'pytest>=8.3,<10' 'fakeredis[lua]>=2.28,<3' && python -m pytest -q /workspace/tests -o cache_dir=/tmp/pytest-cache -o junit_family=xunit1 --junitxml=/results/tests.xml"
+```
+
+HTTP-пример для запущенного стека:
+
+```sh
+python scripts/create_example.py .data/example.pdf
+python scripts/smoke.py .data/example.pdf --output .data/smoke-results.json --warm
+```
 
 `create_example.py` создаёт небольшой читаемый английский PDF со стандартным шрифтом:
 пункт `4.2`, ставка `0.1%`, стороны и дата. Русские вопросы в `smoke.py` дополнительно
@@ -325,9 +337,32 @@ python scripts/smoke.py .data/example.pdf --output .data/smoke-results.json
 Документ после smoke сохраняется согласно политике retention; удалить его можно по
 `doc_id` из отчёта.
 
+Замер HTTP pipeline с мониторингом GPU выполняется отдельно от тестов. PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force .data/gpu-benchmark
+docker compose run --rm --no-deps `
+  -v "${PWD}/scripts:/service/scripts:ro" -v "${PWD}/.data:/results" `
+  -e PYTHONPATH=/service api python scripts/benchmark_gpu.py --output-dir /results/gpu-benchmark
+```
+
+`answers.json` содержит индексацию, измерения стадий, найденный ответ, отказ
+при отсутствии сведений и повторный запрос. `gpu.csv` содержит выборки каждые 250 мс,
+`gpu-summary.json` — выборочные максимумы использования всей GPU, включая другие процессы.
+Результаты сохраняются локально в `.data/`, исключённом из Git.
+
+Регрессии `test_handbook.py` используют `severny_kontur_operational_handbook.pdf` и
+`rag_test_answer_key.txt` из корня. Вопросы читаются из `rag_test_questions.txt`, если
+он присутствует, иначе из ключа. Ключ используется только для оценки результатов.
+Тесты создают собственный документ с текущим профилем индекса и удаляют его после проверки.
+Проверяются ответы Q1–Q25, отказы для Q26–Q30 и дословное совпадение
+цитат с исходными страницами PDF. Дополнительный локальный LLM-оценщик проверяет
+смысловую полноту относительно эталона. Он не входит в приложение и не передаёт эталон в RAG.
+
 ## Границы компонентов и достоверности
 
-`api` содержит HTTP-контракты; `services` — сценарии документов, индексации и ответа;
+`api` содержит HTTP-маршруты и защиту запросов; общие контракты находятся в `contracts.py`.
+`services` содержит сценарии документов, индексации и ответа;
 `processing` — PDF parsing и LangChain splitting; `infrastructure` — Qdrant, Redis,
 файлы и локальные модели; `workers` — Celery. Конфигурация централизована в
 `core/config.py`, неизменяемые соглашения — в `core/constants.py`.
@@ -349,6 +384,11 @@ OCR отсутствует. Parser сохраняет текст, который
 консервативно распознаёт нумерованные строки; отсутствующий section не придумывается.
 Номер страницы — физический индекс PDF от 1, не напечатанная метка.
 
+PDF разбирается в отдельном процессе: `RAG_PDF_PARSE_TIMEOUT` ограничивает время,
+`RAG_PDF_MEMORY_LIMIT_MB` — адресное пространство процесса в Linux. Эти ограничения
+действуют до извлечения текста. Ограничения длины текста проверяются дополнительно.
+Поддерживаемая среда сервиса — Linux-контейнеры; Windows без WSL не обеспечивает лимит памяти parser.
+
 `char_start` / `char_end` — полуинтервал Unicode-символов в канонической последовательности
 извлечённых страниц, соединённых `\f`. Чанк не пересекает страницу. Отдельные представления
 для embedding не изменяют исходный текст цитат.
@@ -359,7 +399,11 @@ OCR отсутствует. Parser сохраняет текст, который
 включая непустые строки, лимит 1500 символов для тезиса и 4000 для цитаты. Адаптация
 применяется одинаково к генератору и verifier и не меняет правила принятия ответа.
 
-Генератор возвращает только утверждения с evidence ID и точной цитатой. Затем:
+LLM генератора возвращает утверждения и выбирает `quote_id` из предложенных исходных
+отрывков. Отрывки — точные срезы уже отобранных реранкером фрагментов, включая внутренние
+переносы строк. Генератор проверяет выбранные ID и восстанавливает `fragment_id` и `quote`
+из доверенного контекста, затем создаёт исходный `DraftAnswer`. Текст модели не исправляется
+и не сопоставляется нечётко с источником. Далее:
 
 1. Pydantic проверяет схему и согласованность `found`.
 2. Каждый ID проверяется по реально переданному LLM контексту.
@@ -370,6 +414,10 @@ OCR отсутствует. Parser сохраняет текст, который
 5. При отказе разрешена ровно одна коррекция, после неё повторяются все проверки.
 6. Ответ выдаётся только после успешной проверки. Итоговый текст собирается сервером
    из проверенных утверждений. Лишние поля модели, например придуманные страницы, запрещены.
+
+Verifier получает исходный текст один раз и ссылки утверждений на точные сегменты цитат.
+Пересекающиеся и повторные свидетельства сохраняют границы без многократной передачи текста.
+Ответ, оборванный лимитом вывода модели, также отклоняется и допускает одну коррекцию.
 
 Семантическая проверка сама вероятностная. Совпадение цитаты не доказывает entailment;
 для оценки качества нужны реальные русские документы и размеченные вопросы. При
@@ -390,7 +438,7 @@ rag reindex DOC_ID
 ```
 
 Это внутренняя maintenance-команда; публичного reindex endpoint нет. Активное задание
-нельзя заменить. Модель, revision и chunking входят в `index_profile`; несовместимый
+нельзя заменить. Модель, revision, chunking и версии библиотек индексации входят в `index_profile`; несовместимый
 профиль обнаруживается до ответа. Смена размерности требует отдельной согласованной
 миграции коллекции: приложение никогда не удаляет и не пересоздаёт её автоматически.
 При переиндексации с тем же профилем прежнее поколение остаётся доступным. Если
@@ -402,6 +450,10 @@ Redis хранит регистрацию до публикации Celery. По
 Периодическое восстановление обрабатывает известные активные задания после
 `RAG_STALE_TASK_SECONDS`, превышающего hard time limit. Если worker погиб после
 публикации, существующее поколение распознаётся без повторной индексации.
+Ошибка повторной проверки Qdrant или записи Redis не отменяет Celery retry. Если на последней
+попытке результат публикации неизвестен, задание остаётся для последующей сверки.
+Файловая блокировка inference удерживается до выхода из операции даже при потере Redis lease.
+Это защита одной установки с общим локальным томом, а не распределённая блокировка для разных узлов.
 Сквозной транзакции Redis/Qdrant/файловой системы и exactly-once гарантии нет.
 Сбой до регистрации/подтверждения upload восстанавливается повтором того же запроса.
 
@@ -433,63 +485,12 @@ Qdrant и LLM повторяются только при временных се
 диагностики, поскольку ответы содержат цитаты документа. Эта настройка не включает
 LangSmith, не передаёт данные наружу и не меняет проверки.
 
-Для production остаются: аутентификация и права доступа, квоты, резервное копирование
-volumes, эксплуатационный мониторинг, оценка retrieval/grounding на реальных документах,
-проверка модели нагрузки и сценариев Redis failover. Текущая конфигурация предназначена
-для локального запуска; открывать её порты в интернет без этих мер не следует.
+До занятия потоков API проверяет ключ и ограничивает число запросов:
+`RAG_MAX_ACTIVE_REQUESTS=16`, из них одновременно не более `RAG_MAX_ACTIVE_QUESTIONS=2`
+вопросов. JSON ограничен `RAG_MAX_JSON_BYTES`, чтение тела — `RAG_REQUEST_BODY_TIMEOUT`.
+Compose ограничивает память процессов приложения, временный каталог и размер журналов.
 
-## Расследование invalid_generation, 2026-11-04
-
-Исторический запрос с `generation=130.48 s`, `validation=0.004 s` содержал два вызова
-генератора: первоначальный ответ и одну коррекцию. Отсутствие `verification` и путь
-исполнения показывают, что до семантической проверки он не дошёл. Исходный вопрос
-того запроса не сохранялся, поэтому он не выдаётся за побайтово воспроизведённый.
-
-Повтор на том же индексированном документе с вопросом «Какова неустойка за просрочку
-поставки и её максимальный размер?» воспроизвёл ошибку. Оба HTTP 200 ответа были
-валидным JSON, содержали существующий ID фрагмента и завершились с `done_reason=stop`
-(297 токенов каждый). Причина отказа — замена переводов строк PDF пробелами в `quote`:
-источник содержит `неустойку в\nразмере`, модель возвращала `неустойку в размере`.
-Вторая попытка повторяла ошибку. Проверка точной подстроки правильно возвращала 502.
-Это не прежний отказ компиляции JSON Schema, не обрезание ответа и не OOM.
-
-Уточнены инструкция и обратная связь коррекции: копировать цитату посимвольно,
-сохранять пробелы и переводы строк, представлять их в JSON как `\n`.
-Нормализация источника или ответа не добавлялась. Pydantic, ID, точные цитаты,
-доверенные метаданные, отдельный verifier и ровно одна коррекция сохранены.
-
-Изолированные замеры на M3 Pro / 18 ГБ, контекст 16384, 4 CPU threads, output limit
-1200, temperature=0, keep_alive=0. Использован один и тот же сохранённый контекст.
-Первоначальные запросы отличались только моделью либо `num_gpu`; это одиночные
-наблюдения с загрузкой модели, а не SLA или полноценная оценка качества.
-
-| Первоначальный запрос | Wall | Prefill | Output | Результат |
-|---|---:|---:|---:|---|
-| Qwen3 4B, Docker CPU | 77.01 s | 53.12 s / 1333 токена | 19.34 s / 297 токенов | Неточные цитаты |
-| Qwen3 4B, native Metal | 13.67 s | 3.14 s / 1333 токена | 6.96 s / 297 токенов | Те же неточные цитаты |
-| Qwen2.5 1.5B Instruct, Docker CPU | 22.07 s | 19.31 s / 1331 токен | 0.21 s / 11 токенов | Ошибочный found=false |
-
-Версии сервера различались: Docker 0.17.7, native 0.30.10; эффект версии не отделён
-от эффекта ускорения. Digest Qwen3 в обоих случаях одинаковый:
-`359d7dd4bcdab3d86b87d73ac27966f4dbb9f5efdfcc75d34a8764a09474fae7`.
-`/api/show` идентифицировал его как **Qwen3 4B Thinking 2507**, Q4_K_M, несмотря на
-короткий tag `qwen3:4b`. Поэтому tag нельзя считать неизменным описанием версии весов.
-В захваченных ответах не было отдельного thinking-текста; измеренное время CPU
-приходилось преимущественно на обработку входных токенов.
-
-Docker сообщал 0/37 GPU layers, 2.6 GiB весов, 2.2 GiB KV cache при 16384 и около
-7.7 GiB памяти VM. Native сообщил Metal / Apple M3 Pro и 37/37 GPU layers.
-Большой KV cache повышает расход памяти, но данный отказ был вызван цитатами.
-Снижение num_ctx требует согласованного уменьшения бюджетов контекста; оно не исправляет
-ошибку цитирования. CPU-профиль остаётся поддерживаемым на macOS/Linux/Windows с
-Linux-контейнерами; Metal не является зависимостью приложения.
-
-С уточнённой инструкцией и коррекцией native Qwen3 прошёл весь цикл за **32.50 s**:
-генерация 13.41 s, коррекция 12.84 s, verifier 6.24 s. Первая попытка всё ещё была
-отклонена; вторая сохранила точные переводы строк. Verifier вернул
-`sufficient_evidence=true`, `answers_question=true` и `supported=true` для обоих
-утверждений. Цитаты восстановлены с реальной страницы 3 и точными координатами.
-
-Сырые локальные артефакты находятся в `.data/diagnostics/` (исключены из Git/Docker
-build context): `baseline.json`, `qwen3-metal-original.json`, `small-cpu-original.json`,
-`qwen3-metal-updated.json` и логи. Они содержат текст тестового документа.
+Для внешнего production-развёртывания нужны TLS, права доступа при нескольких независимых
+клиентах, дисковые квоты, резервное копирование volumes и проверка восстановления,
+мониторинг и нагрузочные испытания под конкретный SLA. Качество retrieval/grounding следует
+оценивать на документах целевого домена. Один ключ установки не заменяет многопользовательскую авторизацию.

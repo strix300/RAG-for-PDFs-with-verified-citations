@@ -1,47 +1,48 @@
 """Извлекает текст PDF постранично; OCR намеренно отсутствует."""
 
+import json
+import subprocess
+import sys
 from pathlib import Path
 
-from pypdf import PdfReader
-from pypdf.errors import PdfReadError
+from pydantic import TypeAdapter
 
 from app.core.config import Settings
-from app.core.constants import MAX_DOCUMENT_PAGES, PAGE_SEPARATOR
 from app.core.errors import ApplicationError
 from app.models import Page
 
 
 def parse_pdf(path: Path, settings: Settings) -> list[Page]:
-    """Возвращает текст всех страниц или ошибку с номером нечитаемой страницы.
-
-    Raises:
-        ApplicationError: PDF повреждён, зашифрован, слишком велик или требует OCR.
-    """
+    """Изолирует распаковку недоверенного PDF в процессе с лимитами времени и памяти."""
     try:
-        with path.open("rb") as source:
-            reader = PdfReader(source)
-            if reader.is_encrypted:
-                raise ApplicationError("encrypted_pdf", "Зашифрованные PDF не поддерживаются.")
-            if not 1 <= len(reader.pages) <= MAX_DOCUMENT_PAGES:
-                raise ApplicationError("page_limit", "Допускается PDF от 1 до 100 страниц.")
-            pages: list[Page] = []
-            offset = 0
-            for number, original in enumerate(reader.pages, start=1):
-                text = original.extract_text() or ""
-                if not text.strip():
-                    raise ApplicationError(
-                        "page_without_text",
-                        f"На странице {number} нет извлекаемого текста. OCR не поддерживается.",
-                    )
-                if (
-                    len(text) > settings.max_page_chars
-                    or offset + len(text) > settings.max_document_chars
-                ):
-                    raise ApplicationError(
-                        "text_limit", "Превышен допустимый объём извлечённого текста.",
-                    )
-                pages.append(Page(number=number, text=text, char_start=offset))
-                offset += len(text) + len(PAGE_SEPARATOR)
-            return pages
-    except (PdfReadError, ValueError, OSError) as exc:
-        raise ApplicationError("invalid_pdf", "Не удалось прочитать исходный PDF.") from exc
+        result = subprocess.run(
+            [sys.executable, "-m", "app.processing.pdf_worker"],
+            input=json.dumps(
+                {
+                    "path": str(path.resolve()),
+                    "memory_mb": settings.pdf_memory_limit_mb,
+                    "max_page_chars": settings.max_page_chars,
+                    "max_document_chars": settings.max_document_chars,
+                }
+            ),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=settings.pdf_parse_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ApplicationError("pdf_timeout", "Превышено время разбора PDF.") from exc
+    except OSError as exc:
+        raise ApplicationError(
+            "parser_unavailable", "Не удалось запустить разбор PDF.", 503
+        ) from exc
+    if result.returncode:
+        raise ApplicationError("pdf_resource_limit", "PDF не удалось разобрать в пределах лимитов.")
+    try:
+        payload = json.loads(result.stdout)
+        if "error" in payload:
+            raise ApplicationError(payload["error"]["code"], payload["error"]["message"])
+        return TypeAdapter(list[Page]).validate_python(payload["pages"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ApplicationError("parser_failed", "Некорректный результат разбора PDF.", 500) from exc

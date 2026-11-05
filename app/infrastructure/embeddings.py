@@ -2,6 +2,7 @@
 
 import gc
 import json
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
@@ -21,10 +22,12 @@ def model_directory(settings: Settings, role: str, model: str, revision: str) ->
     marker = directory / "rag-model.json"
     if not marker.exists():
         raise ApplicationError("models_missing", "Сначала выполните rag download-models.", 503)
-    metadata = json.loads(marker.read_text())
+    metadata = json.loads(marker.read_text(encoding="utf-8"))
     if metadata.get("model") != model or metadata.get("revision") != revision:
         raise ApplicationError(
-            "model_cache_mismatch", "Кеш модели не соответствует настройкам.", 503,
+            "model_cache_mismatch",
+            "Кеш модели не соответствует настройкам.",
+            503,
         )
     return directory
 
@@ -56,7 +59,10 @@ class LocalEmbeddings:
         from transformers import AutoTokenizer
 
         directory = model_directory(
-            self.settings, "dense", self.settings.dense_model, self.settings.dense_revision,
+            self.settings,
+            "dense",
+            self.settings.dense_model,
+            self.settings.dense_revision,
         )
         torch.set_num_threads(self.settings.inference_threads)
         try:
@@ -69,20 +75,31 @@ class LocalEmbeddings:
                     "batch_size": self.settings.embedding_batch_size,
                 },
             )
+            model_limit = self.dense._client.max_seq_length
+            if self.settings.dense_max_tokens > model_limit:
+                raise ApplicationError(
+                    "embedding_token_limit",
+                    "Лимит токенов превышает возможности dense-модели.",
+                    503,
+                )
             self.sparse = FastEmbedSparse(
                 model_name=self.settings.sparse_model,
                 cache_dir=str(self.settings.model_cache_dir / "sparse"),
                 threads=self.settings.inference_threads,
                 language=self.settings.bm25_language,
                 disable_stemmer=self.settings.bm25_disable_stemmer,
-                k=self.settings.bm25_k, b=self.settings.bm25_b, avg_len=self.settings.bm25_avg_len,
+                k=self.settings.bm25_k,
+                b=self.settings.bm25_b,
+                avg_len=self.settings.bm25_avg_len,
                 local_files_only=True,
             )
         except BaseException as exc:
             self.__exit__(None, None, None)
             if isinstance(exc, (OSError, ValueError, RuntimeError)):
                 raise ApplicationError(
-                    "embedding_model_error", "Не удалось загрузить локальные эмбеддинги.", 503,
+                    "embedding_model_error",
+                    "Не удалось загрузить локальные эмбеддинги.",
+                    503,
                 ) from exc
             raise
         return self
@@ -104,20 +121,28 @@ class LocalEmbeddings:
         if self.dense is None or self.sparse is None:
             raise RuntimeError("Модель не загружена.")
         texts = [chunk.text for chunk in chunks]
-        dense = self.dense.embed_documents([
-            self.settings.dense_document_prefix + text for text in texts
-        ])
-        sparse = self.sparse.embed_documents(texts)
+        prefixed = [self.settings.dense_document_prefix + text for text in texts]
+        for text in prefixed:
+            self._validate_input(text, "chunk_too_long")
+        try:
+            dense = self.dense.embed_documents(prefixed)
+            sparse = self.sparse.embed_documents(texts)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ApplicationError(
+                "embedding_failed",
+                "Не удалось вычислить эмбеддинги документа.",
+                503,
+            ) from exc
         embedded = []
         for chunk, dense_vector, sparse_vector in zip(chunks, dense, sparse, strict=True):
-            if len(dense_vector) != self.settings.dense_dimensions:
-                raise ApplicationError(
-                    "embedding_dimension", "Размерность модели несовместима с индексом.", 503,
+            self._validate_vector(dense_vector)
+            embedded.append(
+                EmbeddedChunk(
+                    chunk=chunk,
+                    dense=dense_vector,
+                    sparse=SparseVector(indices=sparse_vector.indices, values=sparse_vector.values),
                 )
-            embedded.append(EmbeddedChunk(
-                chunk=chunk, dense=dense_vector,
-                sparse=SparseVector(indices=sparse_vector.indices, values=sparse_vector.values),
-            ))
+            )
         return embedded
 
     def embed_question(self, question: str) -> tuple[list[float], SparseVector]:
@@ -125,8 +150,32 @@ class LocalEmbeddings:
         if self.dense is None or self.sparse is None:
             raise RuntimeError("Модель не загружена.")
         text = self.settings.dense_query_prefix + question
-        if self.count_tokens(text) + 2 > self.settings.dense_max_tokens:
-            raise ApplicationError("question_too_long", "Вопрос превышает лимит токенов модели.")
-        dense = self.dense.embed_query(text)
-        sparse = self.sparse.embed_query(question)
+        self._validate_input(text, "question_too_long")
+        try:
+            dense = self.dense.embed_query(text)
+            sparse = self.sparse.embed_query(question)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ApplicationError(
+                "embedding_failed",
+                "Не удалось вычислить эмбеддинги вопроса.",
+                503,
+            ) from exc
+        self._validate_vector(dense)
         return dense, SparseVector(indices=sparse.indices, values=sparse.values)
+
+    def _validate_input(self, text: str, code: str) -> None:
+        if self.tokenizer is None:
+            raise RuntimeError("Модель не загружена.")
+        if (
+            len(self.tokenizer.encode(text, add_special_tokens=True))
+            > self.settings.dense_max_tokens
+        ):
+            raise ApplicationError(code, "Текст превышает лимит токенов dense-модели.")
+
+    def _validate_vector(self, vector: list[float]) -> None:
+        if len(vector) != self.settings.dense_dimensions or not all(map(math.isfinite, vector)):
+            raise ApplicationError(
+                "embedding_dimension",
+                "Модель вернула вектор, несовместимый с индексом.",
+                503,
+            )

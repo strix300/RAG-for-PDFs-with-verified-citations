@@ -8,6 +8,8 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from app.core.config import Settings
+
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
@@ -23,10 +25,13 @@ def test_scanned_page_failure_is_visible_through_api() -> None:
     source = BytesIO()
     writer.write(source)
     with httpx.Client(
-        base_url=os.getenv("RAG_TEST_API_URL", "http://localhost:8000"), timeout=10,
+        base_url=os.getenv("RAG_TEST_API_URL", "http://localhost:8000"),
+        timeout=10,
+        headers={"Authorization": f"Bearer {Settings().api_key.get_secret_value()}"},
     ) as client:
         upload = client.post(
-            "/documents", data={"title": f"test-{uuid4()}"},
+            "/documents",
+            data={"title": f"test-{uuid4()}"},
             files={"file": ("blank.pdf", source.getvalue(), "application/pdf")},
         )
         assert upload.status_code == 202

@@ -3,7 +3,9 @@
 import argparse
 import json
 import logging
+import secrets
 import sys
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
@@ -12,6 +14,22 @@ from app.core.config import Settings
 from app.core.errors import ApplicationError
 
 logger = logging.getLogger(__name__)
+
+
+def initialize_api_key(path: Path) -> None:
+    """Сохраняет ключ в локальном env-файле, не выводя секрет в терминал."""
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("RAG_API_KEY="):
+            if line.removeprefix("RAG_API_KEY=").strip():
+                return
+            lines[index] = f"RAG_API_KEY={secrets.token_urlsafe(32)}"
+            break
+    else:
+        lines.append(f"RAG_API_KEY={secrets.token_urlsafe(32)}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(0o600)
 
 
 def download_models(settings: Settings) -> None:
@@ -27,31 +45,43 @@ def download_models(settings: Settings) -> None:
         marker = directory / "rag-model.json"
         expected = {"model": model, "revision": revision}
         if marker.exists():
-            existing = json.loads(marker.read_text())
+            existing = json.loads(marker.read_text(encoding="utf-8"))
             if any(existing.get(key) != value for key, value in expected.items()):
                 raise ApplicationError(
-                    "model_cache_mismatch", "Для другой модели выберите новый каталог кеша.",
+                    "model_cache_mismatch",
+                    "Для другой модели выберите новый каталог кеша.",
                 )
             logger.info("model_cached role=%s", role)
             continue
         commit = HfApi().model_info(model, revision=revision, token=False).sha
         snapshot_download(
-            repo_id=model, revision=commit, local_dir=str(directory), token=False,
+            repo_id=model,
+            revision=commit,
+            local_dir=str(directory),
+            token=False,
             ignore_patterns=["onnx/*", "openvino/*", "*.h5", "*.msgpack", "*.ot"],
         )
         marker.write_text(json.dumps({**expected, "commit": commit}), encoding="utf-8")
     FastEmbedSparse(
-        model_name=settings.sparse_model, cache_dir=str(settings.model_cache_dir / "sparse"),
-        language=settings.bm25_language, disable_stemmer=settings.bm25_disable_stemmer,
-        k=settings.bm25_k, b=settings.bm25_b, avg_len=settings.bm25_avg_len,
+        model_name=settings.sparse_model,
+        cache_dir=str(settings.model_cache_dir / "sparse"),
+        language=settings.bm25_language,
+        disable_stemmer=settings.bm25_disable_stemmer,
+        k=settings.bm25_k,
+        b=settings.bm25_b,
+        avg_len=settings.bm25_avg_len,
     )
     with httpx.Client(
-        base_url=settings.ollama_url, timeout=settings.download_timeout, trust_env=False,
+        base_url=settings.ollama_url,
+        timeout=settings.download_timeout,
+        trust_env=False,
     ) as client:
         for model in dict.fromkeys([settings.generation_model, settings.verification_model]):
             logger.info("pulling_local_model model=%s", model)
             with client.stream(
-                "POST", "/api/pull", json={"model": model, "stream": True},
+                "POST",
+                "/api/pull",
+                json={"model": model, "stream": True},
             ) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
@@ -59,7 +89,9 @@ def download_models(settings: Settings) -> None:
                         event = json.loads(line)
                         if "error" in event:
                             raise ApplicationError(
-                                "model_download_failed", "Ollama не смог скачать модель.", 503,
+                                "model_download_failed",
+                                "Ollama не смог скачать модель.",
+                                503,
                             )
     logger.info("models_downloaded")
 
@@ -94,7 +126,9 @@ def doctor(settings: Settings) -> None:
     ):
         model_directory(settings, role, model, revision)
     with httpx.Client(
-        base_url=settings.ollama_url, timeout=settings.llm_timeout, trust_env=False,
+        base_url=settings.ollama_url,
+        timeout=settings.llm_timeout,
+        trust_env=False,
     ) as client:
         for model in {settings.generation_model, settings.verification_model}:
             validate_local_model(client, model)
@@ -112,7 +146,7 @@ def reindex(settings: Settings, doc_id: UUID) -> None:
     store = QdrantStore(settings)
     state = TaskState(settings)
     try:
-        with state.document_lease(doc_id, wait=5) as lease:
+        with state.document_lease(doc_id, wait=settings.document_lock_wait_seconds) as lease:
             document = store.get_document(doc_id)
             if document is None or document.deleting:
                 raise ApplicationError("document_not_found", "Документ не найден.", 404)
@@ -125,7 +159,8 @@ def reindex(settings: Settings, doc_id: UUID) -> None:
             lease.ensure_owned()
             store.schedule_generation(document)
             task = TaskRecord(
-                task_id=document.task_id, doc_id=doc_id,
+                task_id=document.task_id,
+                doc_id=doc_id,
                 generation_id=document.pending_generation,
             )
             state.register(task)
@@ -142,9 +177,14 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("download-models", "init", "doctor"):
         commands.add_parser(name)
+    credentials = commands.add_parser("init-api-key")
+    credentials.add_argument("--env-file", type=Path, default=Path(".env"))
     maintenance = commands.add_parser("reindex")
     maintenance.add_argument("doc_id", type=UUID)
     arguments = parser.parse_args()
+    if arguments.command == "init-api-key":
+        initialize_api_key(arguments.env_file)
+        return
     settings = Settings()
     logging.basicConfig(level=settings.log_level)
     try:

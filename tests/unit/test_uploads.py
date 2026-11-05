@@ -18,12 +18,18 @@ def test_title_is_part_of_document_identity() -> None:
     assert document_identity("same_hash", "Договор") != document_identity("same_hash", "Приложение")
 
 
-@pytest.mark.parametrize("content,code", [
-    (b"", "empty_upload"), (b"hello", "unsupported_format"),
-    (b"%PDF-" + b"x" * 100, "upload_too_large"),
-])
+@pytest.mark.parametrize(
+    "content,code",
+    [
+        (b"", "empty_upload"),
+        (b"hello", "unsupported_format"),
+        (b"%PDF-" + b"x" * 100, "upload_too_large"),
+    ],
+)
 def test_invalid_upload_does_not_leave_temporary_files(
-    tmp_path: Path, content: bytes, code: str,
+    tmp_path: Path,
+    content: bytes,
+    code: str,
 ) -> None:
     files = FileStore(Settings(storage_dir=tmp_path, max_upload_bytes=20))
     with pytest.raises(ApplicationError) as error:
@@ -56,7 +62,9 @@ def test_replay_after_crash_before_catalog_creation_registers_original_task(tmp_
 
 @pytest.mark.parametrize("size,status", [(20, 200), (1024, 413)])
 def test_multipart_limit_closes_spooled_files(
-    monkeypatch: pytest.MonkeyPatch, size: int, status: int,
+    monkeypatch: pytest.MonkeyPatch,
+    size: int,
+    status: int,
 ) -> None:
     """Поток без Content-Length ограничивается с освобождением временных файлов."""
     import asyncio
@@ -91,13 +99,14 @@ def test_multipart_limit_closes_spooled_files(
 
     async def chunks() -> AsyncIterator[bytes]:
         for offset in range(0, len(body), 128):
-            yield body[offset:offset + 128]
+            yield body[offset : offset + 128]
 
     async def request() -> httpx.Response:
         transport = httpx.ASGITransport(app=application)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             return await client.post(
-                "/documents", content=chunks(),
+                "/documents",
+                content=chunks(),
                 headers={"Content-Type": "multipart/form-data; boundary=test"},
             )
 

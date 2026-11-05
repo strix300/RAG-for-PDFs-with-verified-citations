@@ -16,7 +16,11 @@ class IndexingService:
     """Разделяет порядок этапов и их инфраструктурные реализации."""
 
     def __init__(
-        self, settings: Settings, store: QdrantStore, state: TaskState, files: FileStore,
+        self,
+        settings: Settings,
+        store: QdrantStore,
+        state: TaskState,
+        files: FileStore,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -27,7 +31,9 @@ class IndexingService:
         """Повторяет идемпотентные записи, не открывая неполный индекс для чтения."""
         if document.deleting or document.pending_generation != task.generation_id:
             raise ApplicationError(
-                "generation_superseded", "Документ удалён или поколение заменено.", 409,
+                "generation_superseded",
+                "Документ удалён или поколение заменено.",
+                409,
             )
         if document.active_generation == task.generation_id:
             task.completed_chunks = document.chunk_count or 0
@@ -35,7 +41,9 @@ class IndexingService:
             return
         if document.index_profile != self.settings.index_profile():
             raise ApplicationError(
-                "index_profile_changed", "Настройки изменились после создания задания.", 409,
+                "index_profile_changed",
+                "Настройки изменились после создания задания.",
+                409,
             )
         with measure(task.timings_ms, "indexing"):
             task.stage = "parsing"
@@ -47,7 +55,10 @@ class IndexingService:
                 with LocalEmbeddings(self.settings) as embeddings:
                     with measure(task.timings_ms, "chunking"):
                         chunks = split_pages(
-                            pages, document, self.settings, embeddings.count_tokens,
+                            pages,
+                            document,
+                            self.settings,
+                            embeddings.count_tokens,
                         )
                     task.total_chunks = len(chunks)
                     task.completed_chunks = 0
@@ -58,7 +69,7 @@ class IndexingService:
                         self.state.save(task)
                         with measure(task.timings_ms, "embedding"):
                             batch = embeddings.embed_chunks(
-                                chunks[start:start + self.settings.qdrant_batch_size],
+                                chunks[start : start + self.settings.qdrant_batch_size],
                             )
                         task.stage = "persisting"
                         with measure(task.timings_ms, "persistence"):
